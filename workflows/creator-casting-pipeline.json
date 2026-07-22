@@ -1,0 +1,1003 @@
+{
+  "name": "Creator Casting Pipeline - Multi-Show Applicant Filter & Router",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "casting-application",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "node-webhook",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        200,
+        400
+      ],
+      "webhookId": "casting-webhook-id"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize + sanitize the raw form payload.\n// Assumes the webform sends: fullName, email, whatsapp, instagram, tiktok,\n// episodeType, googleDriveLink, dateOfBirth, location, availabilityConfirmed,\n// and questionnaireAnswers (JSON string or array of { question, answer }\n// pairs - lets the per-show dynamic question set on the frontend stay\n// decoupled from this node).\n\nconst b = $input.item.json.body || $input.item.json || {};\nconst clean = (s) => (s !== undefined && s !== null ? String(s).trim() : '');\nconst cleanHandle = (h) => {\n  if (!h) return '';\n  const x = String(h).trim();\n  return x.startsWith('@') ? x : '@' + x;\n};\nconst toBool = (v) => v === true || v === 'true' || v === 'on' || v === '1';\n\nconst emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nconst email = clean(b.email).toLowerCase();\nconst isValidEmail = emailRegex.test(email);\n\nconst driveUrl = clean(b.googleDriveLink);\nconst match = driveUrl.match(/\\/d\\/([a-zA-Z0-9_-]+)/) || driveUrl.match(/id=([a-zA-Z0-9_-]+)/);\n\nlet qaPairs = [];\ntry {\n  qaPairs = typeof b.questionnaireAnswers === 'string'\n    ? JSON.parse(b.questionnaireAnswers)\n    : (Array.isArray(b.questionnaireAnswers) ? b.questionnaireAnswers : []);\n} catch (e) {\n  qaPairs = [];\n}\nconst questionnaireText = qaPairs\n  .map(qa => `Q: ${clean(qa.question)}\\nA: ${clean(qa.answer)}`)\n  .join('\\n\\n');\n\nconst episodeType = clean(b.episodeType) || 'Other Formats';\n\n// Age from actual date of birth, not a self-reported checkbox.\nconst dobRaw = clean(b.dateOfBirth);\nconst dob = dobRaw ? new Date(dobRaw) : null;\nconst dobValid = dob instanceof Date && !isNaN(dob.getTime());\nconst age = dobValid ? Math.floor((Date.now() - dob.getTime()) / (365.25 * 24 * 60 * 60 * 1000)) : null;\nconst isAdult = dobValid && age >= 18;\n\nconst location = clean(b.location);\nconst whatsappDigits = clean(b.whatsapp).replace(/\\D/g, '');\nconst instagramNormalized = cleanHandle(b.instagram).toLowerCase().replace('@', '');\nconst tiktokNormalized = cleanHandle(b.tiktok).toLowerCase().replace('@', '');\n\nreturn {\n  json: {\n    fullName: clean(b.fullName),\n    email,\n    isValidEmail,\n    whatsapp: clean(b.whatsapp),\n    whatsappDigits,\n    instagram: cleanHandle(b.instagram),\n    instagramNormalized,\n    tiktok: cleanHandle(b.tiktok),\n    tiktokNormalized,\n    episodeType,\n    googleDriveLink: driveUrl,\n    fileId: match ? match[1] : null,\n    questionnaire: questionnaireText,\n    dateOfBirth: dobRaw,\n    age,\n    isAdult,\n    location,\n    availabilityConfirmed: toBool(b.availabilityConfirmed),\n    applicationKey: `${email}::${episodeType}`,\n    submissionTimestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "node-sanitize",
+      "name": "Sanitize & Normalize Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Master_Log",
+          "mode": "list"
+        },
+        "filtersUI": {},
+        "options": {}
+      },
+      "alwaysOutputData": true,
+      "id": "node-dup-lookup",
+      "name": "Pull Master Log for Duplicate Check",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        530,
+        560
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Real duplicate-identity check: compares this applicant's phone,\n// Instagram, and TikTok against every row already in Master_Log. A\n// fingerprint that's never looked up against past records isn't\n// deduplication - this is the lookup that makes it actually mean something.\n// Soft flag only, not an auto-reject: shared devices/handles happen\n// (e.g. siblings), so a producer should still make the call.\nconst applicant = $('Sanitize & Normalize Payload').item.json;\nconst existingRows = $input.all().map(i => i.json);\n\nconst matches = existingRows.filter(row => {\n  if ((row['Email'] || '').toLowerCase() === applicant.email) return false; // same person reapplying, not a dupe\n  const samePhone = applicant.whatsappDigits && row['Phone Digits'] === applicant.whatsappDigits;\n  const sameIG = applicant.instagramNormalized && row['IG Handle'] === applicant.instagramNormalized;\n  const sameTT = applicant.tiktokNormalized && row['TikTok Handle'] === applicant.tiktokNormalized;\n  return samePhone || sameIG || sameTT;\n});\n\nreturn {\n  json: {\n    ...applicant,\n    isDuplicateIdentity: matches.length > 0,\n    duplicateMatchEmails: matches.map(m => m['Email']).join(', ')\n  }\n};"
+      },
+      "id": "node-dup-flag",
+      "name": "Flag Duplicate Identity",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Hard eligibility gate. Anything that fails here never reaches the\n// AI scoring step - saves API spend and avoids sending a \"fix your\n// video link\" email to someone who was never eligible in the first place.\n//\n// EDIT THIS LIST to match the cities/regions you can actually film in.\nconst VALID_LOCATIONS = ['Lagos', 'Abuja', 'Port Harcourt', 'Ibadan', 'Kano', 'Benin City', 'Kaduna'];\n\nconst j = $json;\nconst reasons = [];\n\nif (!j.isValidEmail) reasons.push('Invalid email format');\nif (!j.fileId) reasons.push('No valid Google Drive link provided');\nif (j.age === null) reasons.push('Date of birth missing or unreadable');\nelse if (!j.isAdult) reasons.push('Under 18');\nif (!j.availabilityConfirmed) reasons.push('Not available for filming dates');\nif (!j.location || !VALID_LOCATIONS.includes(j.location)) reasons.push(`Location (${j.location || 'not provided'}) is outside filming range`);\n\nreturn {\n  json: {\n    ...j,\n    meetsBasicCriteria: reasons.length === 0,\n    disqualifyReasons: reasons.join('; ')\n  }\n};"
+      },
+      "id": "node-eligibility",
+      "name": "Hard Eligibility Filter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "eligible-check",
+              "leftValue": "={{ $json.meetsBasicCriteria }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "node-if-eligible",
+      "name": "Is Eligible?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        860,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Disqualified",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Application Key": "={{ $json.applicationKey }}",
+            "Timestamp": "={{ $json.submissionTimestamp }}",
+            "Email": "={{ $json.email }}",
+            "Full Name": "={{ $json.fullName }}",
+            "Episode Type": "={{ $json.episodeType }}",
+            "Reasons": "={{ $json.disqualifyReasons }}"
+          },
+          "matchingColumns": [
+            "Application Key"
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-log-disqualified",
+      "name": "Log Disqualified Applicant",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1080,
+        620
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.email }}",
+        "subject": "Thanks for your interest",
+        "emailType": "text",
+        "message": "Hi {{ $json.fullName }}, thanks so much for applying! Based on your answers, this particular casting call isn't the right fit right now - but we genuinely appreciate you taking the time. We'll keep your details on file for future opportunities."
+      },
+      "id": "node-decline-email",
+      "name": "Send Decline Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1300,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "method": "HEAD",
+        "url": "=https://drive.google.com/uc?export=view&id={{ $json.fileId }}",
+        "options": {
+          "redirect": {
+            "redirect": {
+              "followRedirects": true
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "node-link-check",
+      "name": "Pre-Flight Video Link Check",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1080,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "link-public-check",
+              "leftValue": "={{ $json.statusCode }}",
+              "rightValue": 200,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "node-if-link-public",
+      "name": "Is Video Link Public?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1300,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Needs_Video_Fix",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Application Key": "={{ $('Sanitize & Normalize Payload').item.json.applicationKey }}",
+            "Timestamp": "={{ $('Sanitize & Normalize Payload').item.json.submissionTimestamp }}",
+            "Email": "={{ $('Sanitize & Normalize Payload').item.json.email }}",
+            "Full Name": "={{ $('Sanitize & Normalize Payload').item.json.fullName }}",
+            "Episode Type": "={{ $('Sanitize & Normalize Payload').item.json.episodeType }}",
+            "Audition Link": "={{ $('Sanitize & Normalize Payload').item.json.googleDriveLink }}"
+          },
+          "matchingColumns": [
+            "Application Key"
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-log-video-fix",
+      "name": "Log Needs Video Fix",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1520,
+        620
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Sanitize & Normalize Payload').item.json.email }}",
+        "subject": "Action needed: your audition video link is private",
+        "emailType": "text",
+        "message": "Hi {{ $('Sanitize & Normalize Payload').item.json.fullName }}, we tried to open your Google Drive audition video but the link is currently restricted. Please update the sharing settings to 'Anyone with the link can view' and reply to this email once it's fixed, so our team can review your submission."
+      },
+      "id": "node-fix-video-email",
+      "name": "Send Fix-Video-Link Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1740,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Sanitize & Normalize Payload').item.json.email }}",
+        "subject": "Application received - Creator Casting",
+        "emailType": "text",
+        "message": "Hi {{ $('Sanitize & Normalize Payload').item.json.fullName }}, thanks for applying! Your application for {{ $('Sanitize & Normalize Payload').item.json.episodeType }} has been received and logged. Our producers review applications on a rolling basis - if you're shortlisted, you'll hear from us directly. You have a 24-hour window to reply to this email if you need to update any details."
+      },
+      "id": "node-confirmation-email",
+      "name": "Send Confirmation Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1520,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a show-specific scoring rubric. This is the core upgrade over\n// scoring everyone against one generic prompt - each show cares about\n// different things, and the AI prompt should reflect that.\nconst j = $json;\n\nconst rubrics = {\n  'Pop the Balloon': 'This is a fast-paced blind elimination dating show. Weight heavily: quick wit and comic timing, physical charisma that reads on camera, decisiveness under pressure, and grace in both rejecting and being rejected in front of an audience.',\n  'Find Your Match': 'This is a compatibility-focused matching show. Weight heavily: emotional intelligence, self-awareness, willingness to be genuinely vulnerable on camera, clarity about what they want in a partner, and any visible relationship red or green flags in their answers.',\n  'Who is the Liar': 'This is a social deception game show. Weight heavily: ability to bluff convincingly without breaking composure, sharp reasoning under pressure, comfort with confrontation, and how entertaining they are whether lying or catching someone else out.'\n};\n\nconst rubricPrompt = rubrics[j.episodeType]\n  || 'This is a general creator casting call. Weight heavily: on-camera charisma, authenticity, and overall entertainment value.';\n\nreturn { json: { ...j, rubricPrompt } };"
+      },
+      "id": "node-build-rubric",
+      "name": "Build Show-Specific Rubric",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1740,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4o",
+        "options": {
+          "responseFormat": "json_object",
+          "temperature": 0.3
+        },
+        "prompt": "=You are a casting producer's assistant. {{ $json.rubricPrompt }}\n\nReturn ONLY valid JSON in this exact shape:\n{\"charisma\": 1-10, \"authenticity\": 1-10, \"cameraPresence\": 1-10, \"dramaPotential\": 1-10, \"archetype\": \"short label\", \"redFlags\": \"none, or a brief description\", \"summary\": \"1-2 sentence producer note\"}\n\nEpisode type: {{ $json.episodeType }}\n\nApplicant questionnaire responses:\n{{ $json.questionnaire }}"
+      },
+      "id": "node-ai-scoring",
+      "name": "AI Casting Score",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.4,
+      "position": [
+        1960,
+        400
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the AI response, fall back safely if it's malformed, and\n// compute a single weighted composite score + review bucket.\nconst upstream = $('Build Show-Specific Rubric').item.json;\nconst aiOutput = $input.item.json || {};\n\nlet parsed;\ntry {\n  const content = aiOutput.message?.content ?? aiOutput.content;\n  parsed = typeof content === 'string' ? JSON.parse(content) : content;\n} catch (e) {\n  parsed = null;\n}\nif (!parsed) {\n  parsed = {\n    charisma: 5, authenticity: 5, cameraPresence: 5, dramaPotential: 5,\n    archetype: 'Unclassified',\n    redFlags: 'AI scoring failed to parse - needs manual review',\n    summary: 'Automated scoring failed for this applicant. Please review manually.'\n  };\n}\n\nconst weights = { charisma: 0.30, authenticity: 0.25, cameraPresence: 0.25, dramaPotential: 0.20 };\nconst composite = Object.keys(weights).reduce(\n  (sum, k) => sum + (Number(parsed[k]) || 5) * weights[k], 0\n);\nconst compositeScore = Math.round(composite * 10) / 10;\n\nlet bucket = 'Pass';\nif (compositeScore >= 8.5) bucket = 'Strong Shortlist';\nelse if (compositeScore >= 6) bucket = 'Maybe';\n\n// A red flag should always get a human look, no matter how high the\n// score is. Never let this auto-promote someone straight to an instant\n// producer alert.\nconst hasRedFlag = parsed.redFlags && String(parsed.redFlags).trim().toLowerCase() !== 'none' && String(parsed.redFlags).trim() !== '';\nif (hasRedFlag && bucket === 'Strong Shortlist') bucket = 'Maybe';\n\nreturn {\n  json: {\n    ...upstream,\n    charisma: parsed.charisma,\n    authenticity: parsed.authenticity,\n    cameraPresence: parsed.cameraPresence,\n    dramaPotential: parsed.dramaPotential,\n    archetype: parsed.archetype,\n    redFlags: parsed.redFlags,\n    producerSummary: parsed.summary,\n    compositeScore,\n    bucket\n  }\n};"
+      },
+      "id": "node-parse-score",
+      "name": "Parse Score & Compute Bucket",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2180,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Master_Log",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Application Key": "={{ $json.applicationKey }}",
+            "Timestamp": "={{ $json.submissionTimestamp }}",
+            "Email": "={{ $json.email }}",
+            "Full Name": "={{ $json.fullName }}",
+            "Episode Type": "={{ $json.episodeType }}",
+            "Composite Score": "={{ $json.compositeScore }}",
+            "Bucket": "={{ $json.bucket }}",
+            "Archetype": "={{ $json.archetype }}",
+            "Phone Digits": "={{ $json.whatsappDigits }}",
+            "IG Handle": "={{ $json.instagramNormalized }}",
+            "TikTok Handle": "={{ $json.tiktokNormalized }}",
+            "Duplicate Flag": "={{ $json.isDuplicateIdentity ? 'Possible match: ' + $json.duplicateMatchEmails : '' }}"
+          },
+          "matchingColumns": [
+            "Application Key"
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-master-log",
+      "name": "Log to Master Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2400,
+        220
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.episodeType }}",
+                    "rightValue": "Pop the Balloon",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Pop the Balloon"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.episodeType }}",
+                    "rightValue": "Find Your Match",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Find Your Match"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.episodeType }}",
+                    "rightValue": "Who is the Liar",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Who is the Liar"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "node-switch",
+      "name": "Route by Episode Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.1,
+      "position": [
+        2400,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Pop_the_Balloon",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Application Key": "={{ $json.applicationKey }}",
+            "Timestamp": "={{ $json.submissionTimestamp }}",
+            "Full Name": "={{ $json.fullName }}",
+            "Email": "={{ $json.email }}",
+            "WhatsApp": "={{ $json.whatsapp }}",
+            "Instagram": "={{ $json.instagram }}",
+            "TikTok": "={{ $json.tiktok }}",
+            "Audition Link": "={{ $json.googleDriveLink }}",
+            "Charisma": "={{ $json.charisma }}",
+            "Authenticity": "={{ $json.authenticity }}",
+            "Camera Presence": "={{ $json.cameraPresence }}",
+            "Drama Potential": "={{ $json.dramaPotential }}",
+            "Composite Score": "={{ $json.compositeScore }}",
+            "Bucket": "={{ $json.bucket }}",
+            "Archetype": "={{ $json.archetype }}",
+            "Red Flags": "={{ $json.redFlags }}",
+            "Producer Summary": "={{ $json.producerSummary }}",
+            "Status": "Needs Review"
+          },
+          "matchingColumns": [
+            "Application Key"
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-upsert-pop-balloon",
+      "name": "Upsert - Pop the Balloon",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2620,
+        220
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Find_Your_Match",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Application Key": "={{ $json.applicationKey }}",
+            "Timestamp": "={{ $json.submissionTimestamp }}",
+            "Full Name": "={{ $json.fullName }}",
+            "Email": "={{ $json.email }}",
+            "WhatsApp": "={{ $json.whatsapp }}",
+            "Instagram": "={{ $json.instagram }}",
+            "TikTok": "={{ $json.tiktok }}",
+            "Audition Link": "={{ $json.googleDriveLink }}",
+            "Charisma": "={{ $json.charisma }}",
+            "Authenticity": "={{ $json.authenticity }}",
+            "Camera Presence": "={{ $json.cameraPresence }}",
+            "Drama Potential": "={{ $json.dramaPotential }}",
+            "Composite Score": "={{ $json.compositeScore }}",
+            "Bucket": "={{ $json.bucket }}",
+            "Archetype": "={{ $json.archetype }}",
+            "Red Flags": "={{ $json.redFlags }}",
+            "Producer Summary": "={{ $json.producerSummary }}",
+            "Status": "Needs Review"
+          },
+          "matchingColumns": [
+            "Application Key"
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-upsert-find-match",
+      "name": "Upsert - Find Your Match",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2620,
+        400
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Who_is_the_Liar",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Application Key": "={{ $json.applicationKey }}",
+            "Timestamp": "={{ $json.submissionTimestamp }}",
+            "Full Name": "={{ $json.fullName }}",
+            "Email": "={{ $json.email }}",
+            "WhatsApp": "={{ $json.whatsapp }}",
+            "Instagram": "={{ $json.instagram }}",
+            "TikTok": "={{ $json.tiktok }}",
+            "Audition Link": "={{ $json.googleDriveLink }}",
+            "Charisma": "={{ $json.charisma }}",
+            "Authenticity": "={{ $json.authenticity }}",
+            "Camera Presence": "={{ $json.cameraPresence }}",
+            "Drama Potential": "={{ $json.dramaPotential }}",
+            "Composite Score": "={{ $json.compositeScore }}",
+            "Bucket": "={{ $json.bucket }}",
+            "Archetype": "={{ $json.archetype }}",
+            "Red Flags": "={{ $json.redFlags }}",
+            "Producer Summary": "={{ $json.producerSummary }}",
+            "Status": "Needs Review"
+          },
+          "matchingColumns": [
+            "Application Key"
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-upsert-who-liar",
+      "name": "Upsert - Who is the Liar",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2620,
+        560
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Other_Formats",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Application Key": "={{ $json.applicationKey }}",
+            "Timestamp": "={{ $json.submissionTimestamp }}",
+            "Full Name": "={{ $json.fullName }}",
+            "Email": "={{ $json.email }}",
+            "Episode Type (as submitted)": "={{ $json.episodeType }}",
+            "WhatsApp": "={{ $json.whatsapp }}",
+            "Instagram": "={{ $json.instagram }}",
+            "Audition Link": "={{ $json.googleDriveLink }}",
+            "Composite Score": "={{ $json.compositeScore }}",
+            "Bucket": "={{ $json.bucket }}",
+            "Producer Summary": "={{ $json.producerSummary }}",
+            "Status": "Needs Review"
+          },
+          "matchingColumns": [
+            "Application Key"
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-upsert-other",
+      "name": "Upsert - Other Formats",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2620,
+        720
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "shortlist-check",
+              "leftValue": "={{ $json.bucket }}",
+              "rightValue": "Strong Shortlist",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "node-if-shortlist",
+      "name": "Is Strong Shortlist?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2400,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "YOUR_SLACK_CHANNEL_ID",
+          "mode": "id"
+        },
+        "text": "=\ud83d\udd25 *STRONG SHORTLIST CANDIDATE*\n*Name:* {{ $json.fullName }}\n*Show:* {{ $json.episodeType }}\n*Composite Score:* {{ $json.compositeScore }}/10\n*Archetype:* _{{ $json.archetype }}_\n*Producer note:* {{ $json.producerSummary }}\n\n\ud83d\udd17 <{{ $json.googleDriveLink }}|Watch audition video>",
+        "otherOptions": {}
+      },
+      "id": "node-slack-alert",
+      "name": "Slack Alert - Strong Shortlist",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        2620,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=\u2b50 Strong Shortlist: {{ $json.fullName }} \u2014 {{ $json.episodeType }} \u2014 {{ $json.compositeScore }}/10",
+        "additionalFields": {}
+      },
+      "id": "node-telegram-alert",
+      "name": "Telegram Alert - Strong Shortlist",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2840,
+        900
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitize & Normalize Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize & Normalize Payload": {
+      "main": [
+        [
+          {
+            "node": "Pull Master Log for Duplicate Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pull Master Log for Duplicate Check": {
+      "main": [
+        [
+          {
+            "node": "Flag Duplicate Identity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag Duplicate Identity": {
+      "main": [
+        [
+          {
+            "node": "Hard Eligibility Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hard Eligibility Filter": {
+      "main": [
+        [
+          {
+            "node": "Is Eligible?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Eligible?": {
+      "main": [
+        [
+          {
+            "node": "Pre-Flight Video Link Check",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Disqualified Applicant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Disqualified Applicant": {
+      "main": [
+        [
+          {
+            "node": "Send Decline Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre-Flight Video Link Check": {
+      "main": [
+        [
+          {
+            "node": "Is Video Link Public?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Video Link Public?": {
+      "main": [
+        [
+          {
+            "node": "Send Confirmation Email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Needs Video Fix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Needs Video Fix": {
+      "main": [
+        [
+          {
+            "node": "Send Fix-Video-Link Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Confirmation Email": {
+      "main": [
+        [
+          {
+            "node": "Build Show-Specific Rubric",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Show-Specific Rubric": {
+      "main": [
+        [
+          {
+            "node": "AI Casting Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Casting Score": {
+      "main": [
+        [
+          {
+            "node": "Parse Score & Compute Bucket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Score & Compute Bucket": {
+      "main": [
+        [
+          {
+            "node": "Log to Master Sheet",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Route by Episode Type",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Is Strong Shortlist?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Episode Type": {
+      "main": [
+        [
+          {
+            "node": "Upsert - Pop the Balloon",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Upsert - Find Your Match",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Upsert - Who is the Liar",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Upsert - Other Formats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Strong Shortlist?": {
+      "main": [
+        [
+          {
+            "node": "Slack Alert - Strong Shortlist",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Slack Alert - Strong Shortlist": {
+      "main": [
+        [
+          {
+            "node": "Telegram Alert - Strong Shortlist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

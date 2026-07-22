@@ -1,0 +1,82 @@
+{
+  "name": "Creator Casting Pipeline - Error Handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "node-error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n hands the Error Trigger a payload shaped roughly like:\n// { execution: { id, url, mode, error: { message, stack, node } }, workflow: { id, name } }\n// Extract defensively - the exact shape has shifted across n8n versions,\n// so don't assume every field is present.\nconst j = $json;\n\nconst workflowName = j.workflow?.name || 'Unknown workflow';\nconst failedNode = j.execution?.error?.node?.name || j.execution?.lastNodeExecuted || 'Unknown node';\nconst errorMessage = j.execution?.error?.message || j.execution?.error?.description || 'No error message captured';\nconst executionUrl = j.execution?.url || '';\nconst executionMode = j.execution?.mode || 'unknown';\n\nreturn {\n  json: {\n    timestamp: new Date().toISOString(),\n    workflowName,\n    failedNode,\n    errorMessage,\n    executionUrl,\n    executionMode\n  }\n};"
+      },
+      "id": "node-format-error",
+      "name": "Format Error Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 300]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Error_Logs", "mode": "list" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Timestamp": "={{ $json.timestamp }}",
+            "Workflow Name": "={{ $json.workflowName }}",
+            "Failed Node": "={{ $json.failedNode }}",
+            "Error Message": "={{ $json.errorMessage }}",
+            "Execution URL": "={{ $json.executionUrl }}",
+            "Execution Mode": "={{ $json.executionMode }}",
+            "Status": "Needs Investigation"
+          },
+          "matchingColumns": ["Timestamp"]
+        },
+        "options": {}
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "id": "node-log-error",
+      "name": "Log to Error_Logs Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [640, 300]
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=🚨 CASTING PIPELINE ERROR\n\n*Workflow:* {{ $json.workflowName }}\n*Failed at:* {{ $json.failedNode }}\n*Error:* {{ $json.errorMessage }}\n*Mode:* {{ $json.executionMode }}\n\n{{ $json.executionUrl ? 'View: ' + $json.executionUrl : '' }}\n\nThis is a system failure, not a routine applicant rejection - something actually broke.",
+        "additionalFields": {}
+      },
+      "id": "node-telegram-error",
+      "name": "Telegram System Error Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [860, 300]
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [[{ "node": "Format Error Report", "type": "main", "index": 0 }]]
+    },
+    "Format Error Report": {
+      "main": [[{ "node": "Log to Error_Logs Sheet", "type": "main", "index": 0 }]]
+    },
+    "Log to Error_Logs Sheet": {
+      "main": [[{ "node": "Telegram System Error Alert", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}
